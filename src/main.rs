@@ -9,13 +9,12 @@
 // Rodrigo A. Romano
 //
 
+use nalgebra::{DMatrix, SMatrix, SVector};
+use nalgebra_sparse::csc::CscMatrix as naCSC;
+use osqp::{CscMatrix, Problem, Settings};
 use serde::Deserialize;
 use serde_pickle as pickle;
 use std::{fs::File, io::BufReader};
-use nalgebra_sparse::csc::CscMatrix as naCSC;
-use nalgebra::{SVector,SMatrix,DMatrix};
-use osqp::{CscMatrix, Problem, Settings};
-
 
 // Matrix type definitions
 type Matrix_ncxnc = SMatrix<f64, 271, 271>;
@@ -60,12 +59,13 @@ struct WFSData {
 const N_BM: u8 = 27;
 
 //
-fn get_valid_y(s_struct: WFSData, wfs_mask: Vec<Vec<bool>>) -> Vec<f64> { 
+fn get_valid_y(s_struct: WFSData, wfs_mask: Vec<Vec<bool>>) -> Vec<f64> {
     let mut y_valid = Vec::new();
-    for seg_mask in wfs_mask.iter(){
+    for seg_mask in wfs_mask.iter() {
         // Commands to take indices of true elements:
         // https://codereview.stackexchange.com/questions/159652/indices-of-true-values
-        let valid_l_idxs: Vec<_> = seg_mask.iter()
+        let valid_l_idxs: Vec<_> = seg_mask
+            .iter()
             .enumerate()
             .filter(|&(_, &value)| value)
             .map(|(index, _)| index)
@@ -79,7 +79,7 @@ fn get_valid_y(s_struct: WFSData, wfs_mask: Vec<Vec<bool>>) -> Vec<f64> {
         // ::retain may be an alternative
         // https://doc.rust-lang.org/std/vec/struct.Vec.html#method.retain
     }
-    return y_valid
+    return y_valid;
 }
 
 fn main() {
@@ -94,8 +94,8 @@ fn main() {
     // Compute QP quadratic term matrix
     let w2 = Matrix_ncxnc::from_vec(qp.data.w2);
     let w3 = Matrix_ncxnc::from_vec(qp.data.w3);
-    let ns = qp.data.dmat.len()/271;
-    println!("Valid lenslets:{}", qp.data.dmat.len()/271);
+    let ns = qp.data.dmat.len() / 271;
+    println!("Valid lenslets:{}", qp.data.dmat.len() / 271);
     let d_wfs = DynMatrix::from_vec(271, 7360, qp.data.dmat).transpose();
 
     let dT_w1_d = {
@@ -107,12 +107,21 @@ fn main() {
     // Extract the upper triangular elements of `P`
     let p_utri = {
         println!("rho_3:{}", qp.data.rho_3);
-        let p = dT_w1_d + w2 + w3.scale(qp.data.rho_3*qp.data.k*qp.data.k);
+        let p = dT_w1_d + w2 + w3.scale(qp.data.rho_3 * qp.data.k * qp.data.k);
         //let p_dense = dT_w1_d + w2 + w3.scale(qp.data.rho_3*qp.data.k*qp.data.k);
         //let csc = nalgebra_sparse::CscMatrix::from(&p_dense).upper_triangle();
         //
-        CscMatrix::from_column_iter_dense(
-            p.nrows(),p.ncols(),p.as_slice().to_vec().into_iter())
+        let p_nnz = p
+            .as_slice()
+            .iter()
+            .filter_map(|&p| if p != 0.0 { Some(1.0) } else { None })
+            .sum::<f64>();
+        println!(
+            "P: {:?}, density: {}%",
+            p.shape(),
+            100. * p_nnz / (p.ncols() * p.nrows()) as f64
+        );
+        CscMatrix::from_column_iter_dense(p.nrows(), p.ncols(), p.as_slice().to_vec().into_iter())
             .into_upper_tri()
     };
     // Linear QP problem term
@@ -123,59 +132,80 @@ fn main() {
         pickle::from_reader(rdr).unwrap()
     };
     println!("Number of lenslets:{}", s_struct.wfsdata.len());
-    
+
     let y_valid = get_valid_y(s_struct, qp.data.wfs_mask);
     // WFS meas dimension check
     assert_eq!(ns, y_valid.len());
 
-    let q : Vec<f64> = {
+    let q: Vec<f64> = {
         let y_vec = -Vector_ns::from_vec(y_valid);
         (d_wfs.transpose() * y_vec).as_slice().to_vec()
     };
     assert_eq!(271, q.len());
     //q = -y_valid.T.dot(self.W1_D) - self.rho3*u_ant.T.dot(self.W3)*self.k_I
-    
+
     // Inequality constraint matrix: lb <= a_in*u <= ub
     let a_in = {
         // Indices to insert (or remove) S7Rz columns of matrix Tu
-        let iM1S7Rz: u8 =
-        if qp.data.end2end_ordering {41}
-        else {((12+N_BM)*6) + 5};
+        let iM1S7Rz: u8 = if qp.data.end2end_ordering {
+            41
+        } else {
+            ((12 + N_BM) * 6) + 5
+        };
         let iM2S7Rz: u8 =   // Add 1 (+1) to delete
         if qp.data.end2end_ordering {82 +1}
         else  {((12+N_BM)*6) + 10 +1};
 
         //println!("count nonzero: {}", qp.data.tu.iter().filter(|&n| *n != 0.0).count());
-        let tu = DynMatrix::from_vec(273, 1228, qp.data.tu).transpose()
-            .remove_columns_at(&[iM1S7Rz.into(),iM2S7Rz.into()]);
+        let tu = DynMatrix::from_vec(273, 1228, qp.data.tu)
+            .transpose()
+            .remove_columns_at(&[iM1S7Rz.into(), iM2S7Rz.into()]);
         // Remove S7Rz from Tu
+        let tus = tu.scale(qp.data.k);
+        let tu_nnz = tus.as_slice().iter().fold(0.0, |mut s, p| {
+            if *p != 0.0 {
+                s += 1.0;
+            };
+            s
+        });
+        println!(
+            "Tu: {:?}, nnz: {}, density: {:.0}%",
+            tus.shape(),
+            tu_nnz,
+            100. * tu_nnz / (tus.ncols() * tus.nrows()) as f64
+        );
 
         println!("Number of Tu cols:{}", tu.ncols());
-        CscMatrix::from_column_iter_dense(
-            tu.nrows(), tu.ncols(),
-            tu.scale(qp.data.k).as_slice().to_vec().into_iter())
+        /*CscMatrix::from_column_iter_dense(
+                tu.nrows(),
+                tu.ncols(),
+                tus.as_slice().to_vec().into_iter(),
+        )*/
+        CscMatrix::from(
+            &tus.row_iter()
+                .map(|x| x.clone_owned().as_slice().to_vec())
+                .collect::<Vec<Vec<f64>>>(),
+        )
     };
-    
+
     // QP settings
     let settings = Settings::default()
         .eps_abs(1.0e-8)
         .eps_rel(1.0e-6)
-        .max_iter(500*271)
+        .max_iter(500 * 271)
         .warm_start(true)
         .verbose(true);
-     
+
     // Create an OSQP problem
-    let mut prob = Problem::new(p_utri,&q,a_in,&qp.data.umin,&qp.data.umax,&settings)
-       .expect("Failed to setup problem!");
+    let mut prob = Problem::new(p_utri, &q, a_in, &qp.data.umin, &qp.data.umax, &settings)
+        .expect("Failed to setup problem!");
 
     // Solve problem
     let result = prob.solve();
-    
+
     // Print the solution
     let u = result.x().expect("Failed to solve problem!");
     for i in 0..7 {
-        println!("{}",format!("{:.4e}", u[i]));
+        println!("{}", format!("{:.4e}", u[i]));
     }
-    
-    
 }
